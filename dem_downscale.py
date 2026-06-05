@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Dict, Iterator, Optional, Tuple
 import warnings
 
@@ -26,6 +27,7 @@ from pyproj import CRS as PyprojCRS
 from rasterio.crs import CRS
 from rasterio.warp import transform as transform_coords
 from rasterio.windows import Window
+from tqdm.auto import tqdm
 
 
 @dataclass(frozen=True)
@@ -146,6 +148,38 @@ def read_coarse_array(path: Path) -> Tuple[np.ndarray, np.ndarray, Dict]:
         profile = ds.profile.copy()
         valid = finite_valid(data, ds.nodata)
     return data, valid, profile
+
+
+def make_output_path(input_path: Path, output_dir: Path) -> Path:
+    """根据输入 tif 生成 30 m 输出路径。
+
+    输入：
+        input_path：原始温度或降水 tif 路径。
+        output_dir：输出目录。
+    输出：
+        输出 tif 路径，文件名格式为“原文件名_30m.tif”。
+    """
+
+    return output_dir / f"{input_path.stem}_30m{input_path.suffix}"
+
+
+def list_tif_files(input_dir: Path, pattern: str = r"^.+\.tif$") -> list[Path]:
+    """列出目录中符合正则的 tif 文件。
+
+    输入：
+        input_dir：温度或降水输入目录。
+        pattern：文件名正则。默认只匹配真正以 .tif 结尾的文件，因此会过滤 .tif.ovr 等文件。
+    输出：
+        已按文件名排序的 tif 文件列表。
+    """
+
+    if not input_dir.exists():
+        raise FileNotFoundError(f"输入目录不存在：{input_dir}")
+    if not input_dir.is_dir():
+        raise NotADirectoryError(f"输入路径不是目录：{input_dir}")
+
+    regex = re.compile(pattern, re.IGNORECASE)
+    return sorted(path for path in input_dir.iterdir() if path.is_file() and regex.match(path.name))
 
 
 def log_step(message: str, path: Optional[Path] = None) -> None:
@@ -401,7 +435,7 @@ def downscale_temperature(
     delta_parent_mean = accumulate_temperature_delta_mean(
         temp_path, dem_path, dem_1km, valid_temp, stats.slope, config
     )
-    output_path = output_dir / temp_path.name
+    output_path = make_output_path(temp_path, output_dir)
     write_stats = write_temperature_output(
         temp_path,
         dem_path,
@@ -566,7 +600,7 @@ def downscale_precipitation(
     weight_parent_mean = accumulate_precip_weight_mean(
         precip_path, dem_path, dem_1km, precip, valid_precip, stats.slope, config
     )
-    output_path = output_dir / precip_path.name
+    output_path = make_output_path(precip_path, output_dir)
     write_stats = write_precip_output(
         precip_path,
         dem_path,
@@ -938,10 +972,37 @@ def print_results(results: Dict[str, object]) -> None:
 
 
 if __name__ == "__main__":
-    results = downscale_month(
-        temp_path=r"E:\lianghao\项目\阿坝\tem202501四川.tif",
-        precip_path=r"E:\lianghao\项目\阿坝\pre_202501四川.tif",
-        dem_path=r"E:\lianghao\项目\阿坝\aba_DEM1.tif",
-        output_dir=r"E:\lianghao\项目\阿坝\test",
-    )
-    print_results(results)
+    # 单文件测试路径保留在这里作为参考；当前主程序改为文件夹批处理，不直接使用这两个变量。
+    # single_temp_path = r"E:\lianghao\项目\阿坝\tem202501四川.tif"
+    # single_precip_path = r"E:\lianghao\项目\阿坝\pre_202501四川.tif"
+
+    temp_input_dir = Path(r"E:\lianghao\项目\阿坝\temperature")  # 输入温度tif数据的目录，里面应该仅有温度tif
+    precip_input_dir = Path(r"E:\lianghao\项目\阿坝\precipitation")  # 输入降水tif数据的目录，里面应该仅有降水tif
+    dem_file = Path(r"E:\lianghao\项目\阿坝\aba_DEM1.tif")  # 30 m DEM文件路径
+    output_dir = Path(r"E:\lianghao\项目\阿坝\test")  # 输出目录，结果会保存在这里
+
+    # 默认正则只匹配真正以 .tif 结尾的文件，会自动过滤 .tif.ovr、.tif.aux.xml 等附属文件。
+    tif_pattern = r"^.+\.tif$"
+    temp_files = list_tif_files(temp_input_dir, tif_pattern)
+    precip_files = list_tif_files(precip_input_dir, tif_pattern)
+    file_pairs = list(zip(temp_files, precip_files))
+
+    print(f"温度文件夹：{temp_input_dir}", flush=True)
+    print(f"降水文件夹：{precip_input_dir}", flush=True)
+    print(f"匹配到温度 tif：{len(temp_files)} 个", flush=True)
+    print(f"匹配到降水 tif：{len(precip_files)} 个", flush=True)
+    if len(temp_files) != len(precip_files):
+        print(
+            f"警告：温度和降水 tif 数量不一致，将按排序后的 zip 结果处理 {len(file_pairs)} 对文件。",
+            flush=True,
+        )
+
+    for temp_file, precip_file in tqdm(file_pairs, desc="DEM降尺度批处理", unit="组"):
+        tqdm.write(f"开始处理：温度={temp_file.name}；降水={precip_file.name}")
+        results = downscale_month(
+            temp_path=str(temp_file),
+            precip_path=str(precip_file),
+            dem_path=str(dem_file),
+            output_dir=str(output_dir),
+        )
+        print_results(results)
