@@ -25,7 +25,7 @@ import rasterio
 from affine import Affine
 from pyproj import CRS as PyprojCRS
 from rasterio.crs import CRS
-from rasterio.warp import transform as transform_coords
+from rasterio.warp import transform as transform_coords, transform_bounds
 from rasterio.windows import Window
 from tqdm.auto import tqdm
 
@@ -117,6 +117,14 @@ def map_dem_window_to_coarse(
     coarse_ds: rasterio.io.DatasetReader,
     window: Window,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """将 DEM 像元中心按最近邻规则映射到原始粗栅格父像元。
+
+    该过程先把 DEM 像元中心坐标转换到粗栅格 CRS，再使用粗栅格逆仿射变换
+    取得所属像元。对于常规北向栅格，这等价于把粗栅格通过最近邻法重投影到
+    DEM 的 CRS、分辨率、仿射变换和 shape，但不会生成完整的 30 m 中间栅格。
+    保留原始粗像元行列号也便于后续严格执行父像元内均值保持。
+    """
+
     rows = np.arange(window.row_off, window.row_off + window.height, dtype=np.float64) + 0.5
     cols = np.arange(window.col_off, window.col_off + window.width, dtype=np.float64) + 0.5
     col_grid, row_grid = np.meshgrid(cols, rows)
@@ -140,6 +148,51 @@ def map_dem_window_to_coarse(
         & (coarse_cols < coarse_ds.width)
     )
     return coarse_rows, coarse_cols, inside
+
+
+def validate_raster_inputs(dem_path: Path, coarse_path: Path) -> None:
+    """检查输入栅格能否按 DEM 网格进行最近邻映射和降尺度。"""
+
+    if not dem_path.exists():
+        raise FileNotFoundError(f"DEM 文件不存在：{dem_path}")
+    if not coarse_path.exists():
+        raise FileNotFoundError(f"粗分辨率输入文件不存在：{coarse_path}")
+
+    with rasterio.open(dem_path) as dem_ds, rasterio.open(coarse_path) as coarse_ds:
+        if dem_ds.count < 1:
+            raise ValueError(f"DEM 没有可读取波段：{dem_path}")
+        if coarse_ds.count < 1:
+            raise ValueError(f"粗分辨率输入没有可读取波段：{coarse_path}")
+        if dem_ds.crs is None:
+            raise ValueError(f"DEM 缺少 CRS，无法作为输出参考：{dem_path}")
+        if coarse_ds.crs is None:
+            raise ValueError(f"粗分辨率输入缺少 CRS，无法投影到 DEM 网格：{coarse_path}")
+
+        dem_determinant = dem_ds.transform.a * dem_ds.transform.e - dem_ds.transform.b * dem_ds.transform.d
+        coarse_determinant = (
+            coarse_ds.transform.a * coarse_ds.transform.e
+            - coarse_ds.transform.b * coarse_ds.transform.d
+        )
+        if not np.isfinite(dem_determinant) or abs(dem_determinant) <= np.finfo(float).eps:
+            raise ValueError(f"DEM 仿射变换不可逆：{dem_path}")
+        if not np.isfinite(coarse_determinant) or abs(coarse_determinant) <= np.finfo(float).eps:
+            raise ValueError(f"粗分辨率输入仿射变换不可逆：{coarse_path}")
+
+        coarse_bounds_in_dem = transform_bounds(
+            coarse_ds.crs,
+            dem_ds.crs,
+            *coarse_ds.bounds,
+            densify_pts=21,
+        )
+        left = max(dem_ds.bounds.left, coarse_bounds_in_dem[0])
+        bottom = max(dem_ds.bounds.bottom, coarse_bounds_in_dem[1])
+        right = min(dem_ds.bounds.right, coarse_bounds_in_dem[2])
+        top = min(dem_ds.bounds.top, coarse_bounds_in_dem[3])
+        if left >= right or bottom >= top:
+            raise ValueError(
+                "粗分辨率输入投影到 DEM CRS 后与 DEM 无空间重叠："
+                f"{coarse_path}"
+            )
 
 
 def read_coarse_array(path: Path) -> Tuple[np.ndarray, np.ndarray, Dict]:
@@ -180,6 +233,43 @@ def list_tif_files(input_dir: Path, pattern: str = r"^.+\.tif$") -> list[Path]:
 
     regex = re.compile(pattern, re.IGNORECASE)
     return sorted(path for path in input_dir.iterdir() if path.is_file() and regex.match(path.name))
+
+
+def extract_year_month(path: Path, variable: str) -> Optional[str]:
+    """从 tem202501...tif 或 pre_202501...tif 文件名提取 YYYYMM。"""
+
+    prefixes = {
+        "temperature": r"tem",
+        "precipitation": r"pre(?:cip)?",
+    }
+    if variable not in prefixes:
+        raise ValueError(f"不支持的变量类型：{variable}")
+    match = re.match(
+        rf"^{prefixes[variable]}[_-]?(?P<year_month>\d{{4}}(?:0[1-9]|1[0-2])).*\.tif$",
+        path.name,
+        re.IGNORECASE,
+    )
+    return match.group("year_month") if match else None
+
+
+def index_monthly_files(files: list[Path], variable: str) -> Dict[str, Path]:
+    """按年月索引输入文件；无法识别或同月重复的文件会打印并跳过。"""
+
+    indexed: Dict[str, Path] = {}
+    for path in sorted(files, key=lambda item: item.name.lower()):
+        year_month = extract_year_month(path, variable)
+        if year_month is None:
+            print(f"跳过无法识别年月的{variable}文件：{path.name}", flush=True)
+            continue
+        if year_month in indexed:
+            print(
+                f"警告：{variable}月份 {year_month} 存在重复文件，"
+                f"保留 {indexed[year_month].name}，跳过 {path.name}",
+                flush=True,
+            )
+            continue
+        indexed[year_month] = path
+    return indexed
 
 
 def log_step(message: str, path: Optional[Path] = None) -> None:
@@ -416,6 +506,7 @@ def downscale_temperature(
     """
 
     log_step("开始温度降尺度", temp_path)
+    validate_raster_inputs(dem_path, temp_path)
     temp, valid_temp, _ = read_coarse_array(temp_path)
     log_step(f"完成温度读取，有效粗像元数 {int(valid_temp.sum())}", temp_path)
     valid_temp &= finite_valid(temp, None, config.temp_valid_min, config.temp_valid_max)
@@ -539,8 +630,8 @@ def write_precip_output(
                     values[positive] = precip[pr, pc] * normalized_weight
                     weight_min = min(weight_min, float(np.nanmin(normalized_weight)))
                     weight_max = max(weight_max, float(np.nanmax(normalized_weight)))
-                values = np.maximum(values, 0.0)
                 negative_pixels += int(np.sum(values < 0))
+                values = np.maximum(values, 0.0)
                 out[valid] = values.astype(np.float32)
             invalid_pixels += int((~valid).sum())
             out_ds.write(out, 1, window=window)
@@ -576,6 +667,7 @@ def downscale_precipitation(
     """
 
     log_step("开始降水降尺度", precip_path)
+    validate_raster_inputs(dem_path, precip_path)
     precip, valid_precip, _ = read_coarse_array(precip_path)
     log_step(f"完成降水读取，有效粗像元数 {int(valid_precip.sum())}", precip_path)
     valid_precip &= precip >= 0
@@ -755,7 +847,7 @@ def downscale_month(
         temp_path：1 km 温度 tif 路径；为 None 时跳过温度。
         precip_path：1 km 降水 tif 路径；为 None 时跳过降水。
         dem_path：30 m DEM tif 路径。
-        output_dir：输出目录。
+        output_dir：输出根目录；温度和降水分别写入 temperature、precipitation 子目录。
         config：可选参数配置；不传则使用 DownscaleConfig 默认值。
     输出：
         字典形式运行结果，包含输出路径、回归参数、写出统计和 QC 结果。
@@ -764,7 +856,10 @@ def downscale_month(
     cfg = config or DownscaleConfig()
     dem = Path(dem_path)
     out_dir = Path(output_dir)
+    temp_out_dir = out_dir / "temperature"
+    precip_out_dir = out_dir / "precipitation"
     results: Dict[str, object] = {}
+    errors: Dict[str, str] = {}
 
     temp_output: Optional[Path] = None
     precip_output: Optional[Path] = None
@@ -778,28 +873,54 @@ def downscale_month(
         log_step("本次降水输入文件", precip_file)
 
     if temp_file is not None:
-        temp_output, temp_stats, temp_write_stats = downscale_temperature(temp_file, dem, out_dir, cfg)
-        results["temperature"] = {
-            "output": str(temp_output),
-            "gamma": temp_stats.slope,
-            "intercept": temp_stats.intercept,
-            "samples": temp_stats.samples,
-            "fallback_reason": temp_stats.fallback_reason,
-            **temp_write_stats,
-        }
+        try:
+            temp_output, temp_stats, temp_write_stats = downscale_temperature(
+                temp_file, dem, temp_out_dir, cfg
+            )
+            results["temperature"] = {
+                "output": str(temp_output),
+                "gamma": temp_stats.slope,
+                "intercept": temp_stats.intercept,
+                "samples": temp_stats.samples,
+                "fallback_reason": temp_stats.fallback_reason,
+                **temp_write_stats,
+            }
+        except Exception as exc:
+            errors["temperature"] = str(exc)
+            log_step(f"温度处理失败，继续处理其他数据。错误：{exc}", temp_file)
 
     if precip_file is not None:
-        precip_output, precip_stats, precip_write_stats = downscale_precipitation(precip_file, dem, out_dir, cfg)
-        results["precipitation"] = {
-            "output": str(precip_output),
-            "b": precip_stats.slope,
-            "intercept": precip_stats.intercept,
-            "samples": precip_stats.samples,
-            "fallback_reason": precip_stats.fallback_reason,
-            **precip_write_stats,
-        }
+        try:
+            precip_output, precip_stats, precip_write_stats = downscale_precipitation(
+                precip_file, dem, precip_out_dir, cfg
+            )
+            results["precipitation"] = {
+                "output": str(precip_output),
+                "b": precip_stats.slope,
+                "intercept": precip_stats.intercept,
+                "samples": precip_stats.samples,
+                "fallback_reason": precip_stats.fallback_reason,
+                **precip_write_stats,
+            }
+        except Exception as exc:
+            errors["precipitation"] = str(exc)
+            log_step(f"降水处理失败，继续处理其他数据。错误：{exc}", precip_file)
 
-    results["qc"] = run_qc_checks(temp_output, precip_output, temp_file, precip_file, dem, cfg)
+    try:
+        results["qc"] = run_qc_checks(
+            temp_output,
+            precip_output,
+            temp_file if temp_output is not None else None,
+            precip_file if precip_output is not None else None,
+            dem,
+            cfg,
+        )
+    except Exception as exc:
+        errors["qc"] = str(exc)
+        results["qc"] = {}
+        log_step(f"质量检查失败。错误：{exc}", dem)
+    if errors:
+        results["errors"] = errors
     log_step("脚本完成，单月降尺度结束", dem)
     return results
 
@@ -857,6 +978,7 @@ def print_results(results: Dict[str, object]) -> None:
     qc = results.get("qc") if isinstance(results.get("qc"), dict) else {}
     temperature = results.get("temperature")
     precipitation = results.get("precipitation")
+    errors = results.get("errors")
     temp_qc = qc.get("temperature") if isinstance(qc, dict) else None
     precip_qc = qc.get("precipitation") if isinstance(qc, dict) else None
 
@@ -875,6 +997,10 @@ def print_results(results: Dict[str, object]) -> None:
         precip_negative_status = "通过" if isinstance(negative_pixels, (float, int)) and int(negative_pixels) == 0 else "需要检查"
 
     print("\n========== DEM 降尺度运行结果 ==========", flush=True)
+    if isinstance(errors, dict) and errors:
+        print("\n【处理错误】", flush=True)
+        for variable, message in errors.items():
+            print(f"{variable}：{message}", flush=True)
     print("\n【总体结论】", flush=True)
     if isinstance(temperature, dict):
         print(f"温度父像元均值保持：{temp_status}", flush=True)
@@ -976,33 +1102,44 @@ if __name__ == "__main__":
     # single_temp_path = r"E:\lianghao\项目\阿坝\tem202501四川.tif"
     # single_precip_path = r"E:\lianghao\项目\阿坝\pre_202501四川.tif"
 
-    temp_input_dir = Path(r"E:\lianghao\项目\阿坝\temperature")  # 输入温度tif数据的目录，里面应该仅有温度tif
-    precip_input_dir = Path(r"E:\lianghao\项目\阿坝\precipitation")  # 输入降水tif数据的目录，里面应该仅有降水tif
+    temp_input_dir = Path(r"E:\lianghao\项目\阿坝\new_test\temperature")  # 输入温度tif数据的目录，里面应该仅有温度tif
+    precip_input_dir = Path(r"E:\lianghao\项目\阿坝\new_test\precipitation")  # 输入降水tif数据的目录，里面应该仅有降水tif
     dem_file = Path(r"E:\lianghao\项目\阿坝\aba_DEM1.tif")  # 30 m DEM文件路径
-    output_dir = Path(r"E:\lianghao\项目\阿坝\test")  # 输出目录，结果会保存在这里
+    output_dir = Path(r"E:\lianghao\项目\阿坝\new_test\out")  # 输出目录，结果会保存在这里
 
     # 默认正则只匹配真正以 .tif 结尾的文件，会自动过滤 .tif.ovr、.tif.aux.xml 等附属文件。
     tif_pattern = r"^.+\.tif$"
     temp_files = list_tif_files(temp_input_dir, tif_pattern)
     precip_files = list_tif_files(precip_input_dir, tif_pattern)
-    file_pairs = list(zip(temp_files, precip_files))
+    temp_by_month = index_monthly_files(temp_files, "temperature")
+    precip_by_month = index_monthly_files(precip_files, "precipitation")
+    all_months = sorted(set(temp_by_month) | set(precip_by_month))
 
     print(f"温度文件夹：{temp_input_dir}", flush=True)
     print(f"降水文件夹：{precip_input_dir}", flush=True)
     print(f"匹配到温度 tif：{len(temp_files)} 个", flush=True)
     print(f"匹配到降水 tif：{len(precip_files)} 个", flush=True)
-    if len(temp_files) != len(precip_files):
-        print(
-            f"警告：温度和降水 tif 数量不一致，将按排序后的 zip 结果处理 {len(file_pairs)} 对文件。",
-            flush=True,
-        )
+    print(f"识别到月份：{len(all_months)} 个", flush=True)
 
-    for temp_file, precip_file in tqdm(file_pairs, desc="DEM降尺度批处理", unit="组"):
-        tqdm.write(f"开始处理：温度={temp_file.name}；降水={precip_file.name}")
-        results = downscale_month(
-            temp_path=str(temp_file),
-            precip_path=str(precip_file),
-            dem_path=str(dem_file),
-            output_dir=str(output_dir),
+    for year_month in tqdm(all_months, desc="DEM降尺度批处理", unit="月"):
+        temp_file = temp_by_month.get(year_month)
+        precip_file = precip_by_month.get(year_month)
+        if temp_file is None:
+            tqdm.write(f"{year_month} 缺少温度数据，仅处理降水。")
+        if precip_file is None:
+            tqdm.write(f"{year_month} 缺少降水数据，仅处理温度。")
+        tqdm.write(
+            f"开始处理 {year_month}："
+            f"温度={temp_file.name if temp_file else '缺测'}；"
+            f"降水={precip_file.name if precip_file else '缺测'}"
         )
-        print_results(results)
+        try:
+            results = downscale_month(
+                temp_path=str(temp_file) if temp_file else None,
+                precip_path=str(precip_file) if precip_file else None,
+                dem_path=str(dem_file),
+                output_dir=str(output_dir),
+            )
+            print_results(results)
+        except Exception as exc:
+            tqdm.write(f"{year_month} 处理失败，继续下一月份。错误：{exc}")
